@@ -1,25 +1,21 @@
 from __future__ import annotations
 
+import torch
 import torch.nn as nn
 
 
 class DepthwiseSeparableConv1d(nn.Module):
-    def __init__(self, in_ch, out_ch, k, d=1):
+    def __init__(self, in_ch: int, out_ch: int, k: int, d: int = 1):
         super().__init__()
+        pad = d * (k - 1) // 2
         self.dw = nn.Conv1d(
-            in_ch,
-            in_ch,
-            k,
-            padding=d * (k - 1) // 2,
-            dilation=d,
-            groups=in_ch,
-            bias=False,
+            in_ch, in_ch, k, padding=pad, dilation=d, groups=in_ch, bias=False
         )
         self.pw = nn.Conv1d(in_ch, out_ch, 1, bias=False)
         self.bn = nn.BatchNorm1d(out_ch)
         self.act = nn.GELU()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.dw(x)
         x = self.pw(x)
         x = self.bn(x)
@@ -27,16 +23,21 @@ class DepthwiseSeparableConv1d(nn.Module):
 
 
 class TinyTCN(nn.Module):
+    """Reconstruction model: input (B, L, C) -> output (B, L, C)."""
+
     def __init__(self, d_in: int, d_out: int, channels: int = 48, depth: int = 6):
         super().__init__()
-        layers = [nn.Conv1d(d_in, channels, 1)]
+        self.stem = nn.Conv1d(d_in, channels, 1)
+        blocks = []
         for i in range(depth):
-            layers += [DepthwiseSeparableConv1d(channels, channels, k=3, d=2**i)]
-        self.net = nn.Sequential(*layers)
+            blocks.append(DepthwiseSeparableConv1d(channels, channels, k=3, d=2**i))
+        self.body = nn.Sequential(*blocks)
         self.head = nn.Conv1d(channels, d_out, 1)
 
-    def forward(self, x):  # x: (B, L, d_in)
-        x = x.transpose(1, 2)
-        h = self.net(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L, C)
+        x = x.transpose(1, 2)  # -> (B, C, L)
+        h = self.stem(x)
+        h = self.body(h)
         y = self.head(h).transpose(1, 2)
         return y

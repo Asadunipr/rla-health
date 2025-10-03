@@ -1,4 +1,6 @@
 seed: 42
+data_dir: data/mitbih
+out_dir: experiments/results/mitbih
 dataset: mitbih
 sampling_hz: 180
 window: 512
