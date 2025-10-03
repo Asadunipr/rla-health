@@ -38,6 +38,23 @@ def compute_scores(
     return scores
 
 
+def mean_abs_error_batched(
+    model: torch.nn.Module, X: np.ndarray, device: str = "cpu", bs: int = 256
+) -> float:
+    """Mean |x - x_hat| over the whole set, computed in mini-batches."""
+    model.eval()
+    tot = 0.0
+    n = 0
+    with torch.no_grad():
+        for i in range(0, X.shape[0], bs):
+            xb = torch.from_numpy(X[i : i + bs]).to(device)
+            yb = model(xb)
+            e = torch.abs(yb - xb).mean(dim=(1, 2))  # per-window MAE
+            tot += float(e.sum().cpu().item())
+            n += e.shape[0]
+    return tot / max(n, 1)
+
+
 def main(cfg_path: str) -> None:
     cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8"))
 
@@ -111,11 +128,12 @@ def main(cfg_path: str) -> None:
             n_steps += 1
 
         # validation proxy: mean recon error on val normals (lower is better)
-        with torch.no_grad():
-            model.eval()
-            vb = torch.from_numpy(va_ds.X).to(device)
-            vy = model(vb)
-            vloss = torch.mean(torch.abs(vy - vb)).item()
+        # with torch.no_grad():
+        #    model.eval()
+        #    vb = torch.from_numpy(va_ds.X).to(device)
+        #    vy = model(vb)
+        #    vloss = torch.mean(torch.abs(vy - vb)).item()
+        vloss = mean_abs_error_batched(model, va_ds.X, device=device, bs=min(bs, 256))
 
         dt = time.time() - t0
         print(
