@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# Data & results
+data/*
+!data/.gitkeep
+experiments/logs/*
+experiments/results/*
+experiments/tables/*
+experiments/figs/*
+
+# VS Code
+.vscode/*.log

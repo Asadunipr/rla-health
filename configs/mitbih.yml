@@ -1,0 +1,39 @@
+seed: 42
+dataset: mitbih
+sampling_hz: 180
+window: 512
+stride: 128
+forecast_h: 8
+
+frontend:
+  hampel: {window: 17, k: 3.0}
+  stl: {season: 0, robust: true}
+  scale: {method: mad}
+
+model:
+  backbone: tiny_tcn
+  tcn: {channels: 48, depth: 6, dilation: true, se: true}
+  gru: {hidden: 96}
+  params_cap: 200000
+
+training:
+  epochs: 120
+  batch_size: 64
+  optimizer: adam
+  lr: 1e-3
+  loss: huber
+  huber_delta: 1.0
+  trimmed_p: 0.05
+  curriculum: {start_frac: 0.0, end_frac: 0.5}
+
+decision:
+  rho: huber
+  kappa: 2.5
+  smooth_median_len: 5
+
+compression:
+  pruning: {sparsity: 0.5}
+  qat: {enable_epoch: 80}
+
+eval:
+  metrics: [auroc, auprc, f1_at_tau, false_alarms_per_hour, params, size_mb, latency_ms]
