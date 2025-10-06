@@ -2,7 +2,7 @@ import argparse
 import json
 from pathlib import Path
 import time
-from typing import Any, Dict
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -17,76 +17,99 @@ from rla.losses.huber import huber_loss
 from rla.losses.trimmed_mse import trimmed_mse
 from rla.models.tiny_tcn import TinyTCN
 
-# (Optional) keep CPU thread usage sane on Windows; adjust if you have more cores
+# Keep CPU thread usage sane on Windows; tune for your CPU
 torch.set_num_threads(4)
 
 
+# --------------------------
+# Robust standardization
+# --------------------------
+def robust_standardize_with_stats(
+    x: torch.Tensor, eps: float = 1e-6
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Robust per-window, per-channel standardization with returned stats:
+      x' = (x - med_t) / (1.4826 * MAD_t + eps)
+    Shapes: x (B, L, C) -> (x_std, med, scale), all broadcastable.
+    """
+    med = x.median(dim=1, keepdim=True).values
+    mad = (x - med).abs().median(dim=1, keepdim=True).values
+    scale = (1.4826 * mad).clamp_min(eps)
+    return (x - med) / scale, med, scale
+
+
+def unstandardize(
+    y_std: torch.Tensor, med: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """Invert robust standardization: y = y_std * scale + med."""
+    return y_std * scale + med
+
+
+# --------------------------
+# Utilities
+# --------------------------
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)
 
 
-def robust_standardize_torch(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """
-    Robust per-window, per-channel standardization:
-      x' = (x - median_t) / (1.4826 * median_t(|x - median_t|) + eps)
-    Works on (B, L, C).
-    """
-    med = x.median(dim=1, keepdim=True).values
-    mad = (x - med).abs().median(dim=1, keepdim=True).values
-    scale = 1.4826 * mad + eps
-    return (x - med) / scale
-
-
-def mean_abs_error_batched_std(
+def mean_abs_error_batched_raw(
     model: torch.nn.Module,
     X: np.ndarray,
     device: str = "cpu",
     bs: int = 256,
-    use_std: bool = True,
 ) -> float:
-    """Mean |x - x_hat| over an array of windows, computed in mini-batches."""
+    """
+    Mean |x_raw - y_raw| computed in mini-batches.
+    Train may use standardized inputs, but we evaluate in RAW space:
+      1) standardize x -> (x_std, med, scale)
+      2) y_std = model(x_std)
+      3) y_raw = unstandardize(y_std, med, scale)
+      4) MAE(y_raw, x_raw)
+    """
     model.eval()
     tot = 0.0
     n = 0
     with torch.no_grad():
         for i in range(0, X.shape[0], bs):
-            xb = torch.from_numpy(X[i : i + bs]).to(device)
-            xb_in = robust_standardize_torch(xb) if use_std else xb
-            yb = model(xb_in)
-            e = torch.abs(yb - xb_in).mean(dim=(1, 2))  # per-window MAE
+            x_np = X[i : i + bs]
+            xb = torch.from_numpy(x_np).to(device)  # (B, L, C)
+            xb_std, med, scale = robust_standardize_with_stats(xb)
+            yb_std = model(xb_std)
+            yb_raw = unstandardize(yb_std, med, scale)
+            e = torch.abs(yb_raw - xb).mean(dim=(1, 2))  # per-window MAE in RAW space
             tot += float(e.sum().cpu().item())
             n += e.shape[0]
     return tot / max(n, 1)
 
 
-def compute_scores(
+def compute_scores_raw(
     model: torch.nn.Module,
     X: np.ndarray,
     device: str = "cpu",
-    cfg: Dict[str, Any] | None = None,
 ) -> np.ndarray:
     """
-    Reconstruction residual scores per window: mean(|x - x_hat|).
-    Applies robust standardization if enabled in cfg.preprocess.robust_standardize.
+    Reconstruction residual scores per window, **in RAW space**:
+      score = mean(|x_raw - y_raw|)
     """
-    use_std = True
-    if cfg is not None:
-        use_std = bool(cfg.get("preprocess", {}).get("robust_standardize", True))
-
     model.eval()
     scores = np.zeros((X.shape[0],), dtype=np.float32)
     bs = 256
     with torch.no_grad():
         for i in range(0, X.shape[0], bs):
-            xb = torch.from_numpy(X[i : i + bs]).to(device)
-            xb_in = robust_standardize_torch(xb) if use_std else xb
-            yb = model(xb_in)
-            e = torch.abs(yb - xb_in).mean(dim=(1, 2))
+            x_np = X[i : i + bs]
+            xb = torch.from_numpy(x_np).to(device)
+            xb_std, med, scale = robust_standardize_with_stats(xb)
+            yb_std = model(xb_std)
+            yb_raw = unstandardize(yb_std, med, scale)
+            e = torch.abs(yb_raw - xb).mean(dim=(1, 2))
             scores[i : i + bs] = e.cpu().numpy()
     return scores
 
 
+# --------------------------
+# Training
+# --------------------------
 def main(cfg_path: str) -> None:
     # ---- Config & paths ----
     cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8"))
@@ -106,7 +129,7 @@ def main(cfg_path: str) -> None:
     channels = int(cfg["model"]["tcn"]["channels"])
     depth = int(cfg["model"]["tcn"].get("depth", 6))
     model = TinyTCN(d_in=d_in, d_out=d_in, channels=channels, depth=depth)
-    device = "cpu"  # CPU-first; set to "cuda" if you want and have it
+    device = "cpu"  # set "cuda" if available/desired
     model.to(device)
 
     # ---- Optimizer & training params ----
@@ -117,7 +140,6 @@ def main(cfg_path: str) -> None:
     loss_name = cfg["training"]["loss"]
     huber_delta = float(cfg.get("huber_delta", 1.0))
     trimmed_p = float(cfg.get("trimmed_p", 0.05))
-    use_std = bool(cfg.get("preprocess", {}).get("robust_standardize", True))
 
     # Curriculum: sort train windows by per-window std (proxy for hardness)
     stds = tr_ds.X.std(axis=(1, 2))
@@ -154,16 +176,17 @@ def main(cfg_path: str) -> None:
 
         for (xb,) in tr_loader:
             xb = xb.to(device)
-            xb_in = robust_standardize_torch(xb) if use_std else xb
-            yb = model(xb_in)
-            target = xb_in
+            # Train on standardized inputs; reconstruct standardized target
+            xb_std, med, scale = robust_standardize_with_stats(xb)
+            yb_std = model(xb_std)
+            target = xb_std
 
             if loss_name == "huber":
-                loss = huber_loss(yb, target, delta=huber_delta)
+                loss = huber_loss(yb_std, target, delta=huber_delta)
             elif loss_name == "trimmed":
-                loss = trimmed_mse(yb, target, trim_p=trimmed_p)
+                loss = trimmed_mse(yb_std, target, trim_p=trimmed_p)
             else:
-                loss = torch.mean((yb - target) ** 2)
+                loss = torch.mean((yb_std - target) ** 2)
 
             opt.zero_grad()
             loss.backward()
@@ -172,13 +195,12 @@ def main(cfg_path: str) -> None:
             running += loss.item()
             n_steps += 1
 
-        # validation (mini-batches, standardized if enabled)
-        vloss = mean_abs_error_batched_std(
+        # Validation **in RAW space** (memory-safe)
+        vloss = mean_abs_error_batched_raw(
             model,
             va_ds.X,
             device=device,
             bs=val_bs,
-            use_std=use_std,
         )
 
         dt = time.time() - t0
@@ -206,13 +228,14 @@ def main(cfg_path: str) -> None:
     model.load_state_dict(state["state_dict"])
     model.eval()
 
-    # scores on val normals -> τ (no leakage)
-    val_scores = compute_scores(model, va_ds.X, device=device, cfg=cfg)
-    tau = robust_mad_threshold(val_scores, kappa=float(cfg["decision"]["kappa"]))
-    print(f"Robust threshold τ = {tau:.6f}")
+    # scores on val normals (RAW) -> τ (no leakage)
+    val_scores = compute_scores_raw(model, va_ds.X, device=device)
+    kappa = float(cfg["decision"]["kappa"])
+    tau = robust_mad_threshold(val_scores, kappa=kappa)
+    print(f"Robust threshold τ (kappa={kappa}) = {tau:.6f}")
 
-    # scores on test (optionally smoothed)
-    test_scores = compute_scores(model, X_test, device=device, cfg=cfg)
+    # scores on test (RAW), optionally smoothed
+    test_scores = compute_scores_raw(model, X_test, device=device)
     smooth_len = int(cfg["decision"].get("smooth_median_len", 5))
     if smooth_len > 1:
         test_scores = rolling_median(test_scores, win=smooth_len)

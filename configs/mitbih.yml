@@ -6,22 +6,23 @@ model:
   backbone: tiny_tcn
   tcn:
     channels: 48
-    depth: 4         # 6 is fine too; 4 is faster on CPU
+    depth: 4
 
 training:
-  epochs: 40         # with early stopping; was 120
-  batch_size: 256    # lower if RAM is tight (128 or 64)
+  epochs: 40
+  batch_size: 256
   val_batch_size: 256
   lr: 1e-3
-  loss: trimmed      # 'trimmed' | 'huber' | 'mse'
+  loss: trimmed
   huber_delta: 1.0
-  trimmed_p: 0.10    # more aggressive trimming; 0.05–0.10 are reasonable
+  trimmed_p: 0.10
   curriculum_start: 0.5
   early_stop_patience: 12
 
+# train on standardized inputs, but score & validate in RAW space (handled in code)
 preprocess:
-  robust_standardize: true  # apply robust per-window median/MAD standardization
+  robust_standardize: true
 
 decision:
-  kappa: 2.5
-  smooth_median_len: 9      # longer median smoothing to reduce flicker
+  kappa: 1.2           # ↓ from 2.5 since we now score in RAW space
+  smooth_median_len: 7 # moderate smoothing
