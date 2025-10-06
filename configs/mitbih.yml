@@ -1,41 +1,27 @@
 seed: 42
 data_dir: data/mitbih
 out_dir: experiments/results/mitbih
-dataset: mitbih
-sampling_hz: 180
-window: 512
-stride: 128
-forecast_h: 8
-
-frontend:
-  hampel: {window: 17, k: 3.0}
-  stl: {season: 0, robust: true}
-  scale: {method: mad}
 
 model:
   backbone: tiny_tcn
-  tcn: {channels: 48, depth: 6, dilation: true, se: true}
-  gru: {hidden: 96}
-  params_cap: 200000
+  tcn:
+    channels: 48
+    depth: 4         # 6 is fine too; 4 is faster on CPU
 
 training:
-  epochs: 120
-  batch_size: 64
-  optimizer: adam
+  epochs: 40         # with early stopping; was 120
+  batch_size: 256    # lower if RAM is tight (128 or 64)
+  val_batch_size: 256
   lr: 1e-3
-  loss: huber
+  loss: trimmed      # 'trimmed' | 'huber' | 'mse'
   huber_delta: 1.0
-  trimmed_p: 0.05
-  curriculum: {start_frac: 0.0, end_frac: 0.5}
+  trimmed_p: 0.10    # more aggressive trimming; 0.05–0.10 are reasonable
+  curriculum_start: 0.5
+  early_stop_patience: 12
+
+preprocess:
+  robust_standardize: true  # apply robust per-window median/MAD standardization
 
 decision:
-  rho: huber
   kappa: 2.5
-  smooth_median_len: 5
-
-compression:
-  pruning: {sparsity: 0.5}
-  qat: {enable_epoch: 80}
-
-eval:
-  metrics: [auroc, auprc, f1_at_tau, false_alarms_per_hour, params, size_mb, latency_ms]
+  smooth_median_len: 9      # longer median smoothing to reduce flicker
