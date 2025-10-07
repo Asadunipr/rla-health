@@ -13,16 +13,23 @@ training:
   batch_size: 256
   val_batch_size: 256
   lr: 1e-3
-  loss: trimmed
-  huber_delta: 1.0
+  loss: trimmed         # 'trimmed' | 'huber' | 'mse'
+  huber_delta: 0.5
   trimmed_p: 0.10
   curriculum_start: 0.5
   early_stop_patience: 12
+  huber_after_epoch: 20  # switch to Huber after epoch 20 (set -1 to disable)
 
-# train on standardized inputs, but score & validate in RAW space (handled in code)
 preprocess:
+  # Train on standardized inputs; validate & score in RAW space (see code).
   robust_standardize: true
+  # Optional pre-filtering (off by default). Enable via 'true' and set window/k.
+  hampel: false
+  hampel_win: 9
+  hampel_k: 3.0
 
 decision:
-  kappa: 1.2           # ↓ from 2.5 since we now score in RAW space
-  smooth_median_len: 7 # moderate smoothing
+  method: "mad"         # 'mad' or 'quantile'
+  kappa: 1.2            # used if method == 'mad'
+  # quantile: 0.995     # used if method == 'quantile'
+  smooth_median_len: 7

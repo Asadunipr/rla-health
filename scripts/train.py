@@ -10,14 +10,15 @@ from torch.utils.data import DataLoader
 import yaml
 
 from rla.detect.smoothing import rolling_median
-from rla.detect.thresholds import robust_mad_threshold
+from rla.detect.thresholds import robust_mad_threshold, tau_from_quantile
 from rla.eval.metrics import auprc, auroc, f1_at_threshold
 from rla.io.npzloader import NPZWindows
 from rla.losses.huber import huber_loss
 from rla.losses.trimmed_mse import trimmed_mse
 from rla.models.tiny_tcn import TinyTCN
+from rla.robust.hampel import hampel_filter
 
-# Keep CPU thread usage sane on Windows; tune for your CPU
+# Keep CPU thread usage sane on Windows; tune to your CPU (4–8 are sensible)
 torch.set_num_threads(4)
 
 
@@ -46,6 +47,21 @@ def unstandardize(
 
 
 # --------------------------
+# Optional Hampel pre-filter
+# --------------------------
+def hampel_torch(x: torch.Tensor, window: int = 9, k: float = 3.0) -> torch.Tensor:
+    """
+    Apply Hampel filter per batch and channel on CPU (vectorized enough for small windows).
+    x: (B, L, C)
+    """
+    x_np = x.detach().cpu().numpy()
+    for b in range(x_np.shape[0]):
+        for c in range(x_np.shape[2]):
+            x_np[b, :, c] = hampel_filter(x_np[b, :, c], window=window, k=k, axis=0)
+    return torch.from_numpy(x_np).to(x.device)
+
+
+# --------------------------
 # Utilities
 # --------------------------
 def set_seed(seed: int) -> None:
@@ -53,19 +69,31 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
+def make_loader_from_ndarray(X: np.ndarray, batch_size: int) -> DataLoader:
+    t = torch.from_numpy(X)
+    ds = torch.utils.data.TensorDataset(t)
+    return DataLoader(
+        ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=0
+    )
+
+
 def mean_abs_error_batched_raw(
     model: torch.nn.Module,
     X: np.ndarray,
     device: str = "cpu",
     bs: int = 256,
+    use_hampel: bool = False,
+    hampel_win: int = 9,
+    hampel_k: float = 3.0,
 ) -> float:
     """
-    Mean |x_raw - y_raw| computed in mini-batches.
-    Train may use standardized inputs, but we evaluate in RAW space:
-      1) standardize x -> (x_std, med, scale)
-      2) y_std = model(x_std)
-      3) y_raw = unstandardize(y_std, med, scale)
-      4) MAE(y_raw, x_raw)
+    Mean |x_raw - y_raw| in mini-batches.
+    Train may use standardized inputs; here we evaluate in RAW space:
+      1) optional Hampel on x_raw
+      2) standardize x -> (x_std, med, scale)
+      3) y_std = model(x_std)
+      4) y_raw = unstandardize(y_std, med, scale)
+      5) MAE(y_raw, x_raw)
     """
     model.eval()
     tot = 0.0
@@ -73,11 +101,13 @@ def mean_abs_error_batched_raw(
     with torch.no_grad():
         for i in range(0, X.shape[0], bs):
             x_np = X[i : i + bs]
-            xb = torch.from_numpy(x_np).to(device)  # (B, L, C)
+            xb = torch.from_numpy(x_np).to(device)
+            if use_hampel:
+                xb = hampel_torch(xb, window=hampel_win, k=hampel_k)
             xb_std, med, scale = robust_standardize_with_stats(xb)
             yb_std = model(xb_std)
             yb_raw = unstandardize(yb_std, med, scale)
-            e = torch.abs(yb_raw - xb).mean(dim=(1, 2))  # per-window MAE in RAW space
+            e = torch.abs(yb_raw - xb).mean(dim=(1, 2))
             tot += float(e.sum().cpu().item())
             n += e.shape[0]
     return tot / max(n, 1)
@@ -87,6 +117,9 @@ def compute_scores_raw(
     model: torch.nn.Module,
     X: np.ndarray,
     device: str = "cpu",
+    use_hampel: bool = False,
+    hampel_win: int = 9,
+    hampel_k: float = 3.0,
 ) -> np.ndarray:
     """
     Reconstruction residual scores per window, **in RAW space**:
@@ -99,6 +132,8 @@ def compute_scores_raw(
         for i in range(0, X.shape[0], bs):
             x_np = X[i : i + bs]
             xb = torch.from_numpy(x_np).to(device)
+            if use_hampel:
+                xb = hampel_torch(xb, window=hampel_win, k=hampel_k)
             xb_std, med, scale = robust_standardize_with_stats(xb)
             yb_std = model(xb_std)
             yb_raw = unstandardize(yb_std, med, scale)
@@ -129,7 +164,7 @@ def main(cfg_path: str) -> None:
     channels = int(cfg["model"]["tcn"]["channels"])
     depth = int(cfg["model"]["tcn"].get("depth", 6))
     model = TinyTCN(d_in=d_in, d_out=d_in, channels=channels, depth=depth)
-    device = "cpu"  # set "cuda" if available/desired
+    device = "cpu"  # set to "cuda" if available/desired
     model.to(device)
 
     # ---- Optimizer & training params ----
@@ -137,23 +172,31 @@ def main(cfg_path: str) -> None:
     bs = int(cfg["training"]["batch_size"])
     val_bs = int(cfg["training"].get("val_batch_size", min(bs, 256)))
     epochs = int(cfg["training"]["epochs"])
-    loss_name = cfg["training"]["loss"]
+    loss_name = str(cfg["training"]["loss"])
     huber_delta = float(cfg.get("huber_delta", 1.0))
     trimmed_p = float(cfg.get("trimmed_p", 0.05))
+    huber_after = int(
+        cfg["training"].get("huber_after_epoch", -1)
+    )  # -1 means no switch
 
-    # Curriculum: sort train windows by per-window std (proxy for hardness)
+    # Preprocess options
+    use_hampel = bool(cfg.get("preprocess", {}).get("hampel", False))
+    hampel_win = int(cfg.get("preprocess", {}).get("hampel_win", 9))
+    hampel_k = float(cfg.get("preprocess", {}).get("hampel_k", 3.0))
+
+    # Decision options
+    decision_method = str(cfg["decision"].get("method", "mad"))  # "mad" | "quantile"
+    kappa = float(cfg["decision"].get("kappa", 1.2))
+    q = cfg["decision"].get("quantile", None)
+    q = float(q) if q is not None else None
+    smooth_len = int(cfg["decision"].get("smooth_median_len", 7))
+
+    # Curriculum: sort train windows by per-window std (proxy hardness)
     stds = tr_ds.X.std(axis=(1, 2))
     order = np.argsort(stds)  # easiest -> hardest
     X_train_sorted = tr_ds.X[order]
     start_frac = float(cfg["training"].get("curriculum_start", 0.5))
     end_frac = 1.0
-
-    def make_loader(X: np.ndarray) -> DataLoader:
-        tensor = torch.from_numpy(X)
-        ds = torch.utils.data.TensorDataset(tensor)
-        return DataLoader(
-            ds, batch_size=bs, shuffle=True, drop_last=True, num_workers=0
-        )
 
     # Early stopping
     patience = int(cfg["training"].get("early_stop_patience", 15))
@@ -163,11 +206,15 @@ def main(cfg_path: str) -> None:
 
     # ---- Training loop ----
     for epoch in range(1, epochs + 1):
+        # optional loss switch
+        if huber_after >= 0 and epoch > huber_after:
+            loss_name = "huber"
+
         # curriculum slice
         frac = start_frac + (end_frac - start_frac) * (epoch - 1) / max(epochs - 1, 1)
         n_use = max(int(frac * X_train_sorted.shape[0]), bs)
         X_tr_use = X_train_sorted[:n_use]
-        tr_loader = make_loader(X_tr_use)
+        tr_loader = make_loader_from_ndarray(X_tr_use, bs)
 
         model.train()
         running = 0.0
@@ -176,8 +223,10 @@ def main(cfg_path: str) -> None:
 
         for (xb,) in tr_loader:
             xb = xb.to(device)
+            if use_hampel:
+                xb = hampel_torch(xb, window=hampel_win, k=hampel_k)
             # Train on standardized inputs; reconstruct standardized target
-            xb_std, med, scale = robust_standardize_with_stats(xb)
+            xb_std, _, _ = robust_standardize_with_stats(xb)
             yb_std = model(xb_std)
             target = xb_std
 
@@ -195,12 +244,15 @@ def main(cfg_path: str) -> None:
             running += loss.item()
             n_steps += 1
 
-        # Validation **in RAW space** (memory-safe)
+        # Validation **in RAW space**
         vloss = mean_abs_error_batched_raw(
             model,
             va_ds.X,
             device=device,
             bs=val_bs,
+            use_hampel=use_hampel,
+            hampel_win=hampel_win,
+            hampel_k=hampel_k,
         )
 
         dt = time.time() - t0
@@ -229,14 +281,33 @@ def main(cfg_path: str) -> None:
     model.eval()
 
     # scores on val normals (RAW) -> τ (no leakage)
-    val_scores = compute_scores_raw(model, va_ds.X, device=device)
-    kappa = float(cfg["decision"]["kappa"])
-    tau = robust_mad_threshold(val_scores, kappa=kappa)
-    print(f"Robust threshold τ (kappa={kappa}) = {tau:.6f}")
+    val_scores = compute_scores_raw(
+        model,
+        va_ds.X,
+        device=device,
+        use_hampel=use_hampel,
+        hampel_win=hampel_win,
+        hampel_k=hampel_k,
+    )
+    if decision_method == "quantile":
+        assert (
+            q is not None
+        ), "decision.method='quantile' requires decision.quantile in config"
+        tau = tau_from_quantile(val_scores, q=q)
+        print(f"Robust threshold τ from quantile (q={q}) = {tau:.6f}")
+    else:
+        tau = robust_mad_threshold(val_scores, kappa=kappa)
+        print(f"Robust threshold τ from MAD (kappa={kappa}) = {tau:.6f}")
 
-    # scores on test (RAW), optionally smoothed
-    test_scores = compute_scores_raw(model, X_test, device=device)
-    smooth_len = int(cfg["decision"].get("smooth_median_len", 5))
+    # scores on test (RAW)
+    test_scores = compute_scores_raw(
+        model,
+        X_test,
+        device=device,
+        use_hampel=use_hampel,
+        hampel_win=hampel_win,
+        hampel_k=hampel_k,
+    )
     if smooth_len > 1:
         test_scores = rolling_median(test_scores, win=smooth_len)
 
@@ -251,6 +322,13 @@ def main(cfg_path: str) -> None:
             1.4826 * np.median(np.abs(val_scores - np.median(val_scores)))
         ),
         "best_val_l1": float(best_val),
+        "decision_method": decision_method,
+        "kappa": kappa,
+        "quantile": q if q is not None else None,
+        "smooth_median_len": smooth_len,
+        "use_hampel": use_hampel,
+        "hampel_win": hampel_win,
+        "hampel_k": hampel_k,
     }
     print("Test metrics:", metrics)
 
