@@ -37,5 +37,7 @@ preprocess:
 
 decision:
   method: "mad"
-  kappa: 1.0
-  smooth_median_len: 7
+  kappa: 1.2
+  smooth_median_len: 9
+
+
