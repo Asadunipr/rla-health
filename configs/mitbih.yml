@@ -28,8 +28,14 @@ preprocess:
   hampel_win: 9
   hampel_k: 3.0
 
-decision:
-  method: "mad"         # 'mad' or 'quantile'
-  kappa: 1.2            # used if method == 'mad'
+#decision:
+#  method: "mad"         # 'mad' or 'quantile'
+#  kappa: 1.2            # used if method == 'mad'
   # quantile: 0.995     # used if method == 'quantile'
+#  smooth_median_len: 7
+
+
+decision:
+  method: "mad"
+  kappa: 1.0
   smooth_median_len: 7
